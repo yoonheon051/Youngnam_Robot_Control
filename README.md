@@ -27,7 +27,7 @@ Youngnam_Robot_Control/
 │
 └── config/                  # [설정 파일]
     ├── data.json            # 로봇의 위치(Pose) 데이터 저장
-    └── firebase_key.json    # Firebase Admin SDK 비밀키 (보안 주의)
+    └── firebase_key.json    # Firebase Admin SDK 비밀키
 ```
 
 ## 실행 방법
