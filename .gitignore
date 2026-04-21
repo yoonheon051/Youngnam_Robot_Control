@@ -1,0 +1,18 @@
+# Firebase 인증 키 (보안상 절대 업로드 금지)
+*.json
+!data.json  # 로봇 좌표 데이터인 data.json은 제외하고 싶다면 이 줄을 추가
+
+# Python 관련
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# ROS2 관련
+install/
+build/
+log/
+
+# OS 관련
+.DS_Store
