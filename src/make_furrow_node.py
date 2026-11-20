@@ -26,7 +26,19 @@ global hpos         # 로봇의 홈(Home) 포즈
 # 2. 로봇 식별자 상수 및 경로 정의
 # ==============================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__)) # 현재 스크립트 파일의 절대 경로 추출
-JSON_PATH = os.path.join(BASE_DIR, "data.json")        # 포즈 데이터가 저장된 JSON 파일 경로 매핑
+
+
+def find_pose_file():
+    """포즈 데이터(data.json) 위치: 환경변수 POSE_FILE → 스크립트와 같은 폴더 → 저장소의 config/ 폴더 순서로 찾는다.
+    (ros2 run 으로 설치본을 실행하면 스크립트 폴더가 install/ 아래라서, 경로를 직접 줄 수 있게 함)"""
+    candidates = [os.environ.get("POSE_FILE"),
+                  os.path.join(BASE_DIR, "data.json"),
+                  os.path.join(os.path.dirname(BASE_DIR), "config", "data.json")]
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    raise FileNotFoundError("data.json 을 찾지 못했습니다. 찾아본 위치: " + ", ".join(p for p in candidates if p)
+                            + " (환경변수 POSE_FILE 로 경로 지정 가능)")
 
 # 두산로보틱스 협동로봇 드라이버 연동용 하드웨어 상수 설정
 ROBOT_ID = "dsr01"            # ROS 2 네임스페이스 및 로봇 식별자 ID
@@ -44,8 +56,11 @@ DR_init.__dsr__model = ROBOT_MODEL
 
 
 def initialize_robot():
-    """로봇 하드웨어의 엔드이펙터 툴 및 공구 중심점(TCP) 프로파일 설정을 화면에 출력하는 초기화 메서드"""
-    from DSR_ROBOT2 import set_tool, set_tcp  # 메모리 최적화를 위해 호출 시점에만 로봇 제어 API 임포트
+    """로봇 하드웨어의 엔드이펙터 툴 및 공구 중심점(TCP) 프로파일 설정을 화면에 출력하는 초기화 메서드
+
+    주의: 출력만 하고 set_tool()/set_tcp()는 호출하지 않는다. 툴 무게·TCP는 티치펜던트에 설정된 값을 그대로 쓴다.
+    make_furrow 의 힘 제어는 툴 무게 설정에 영향을 받으므로, 실행 전 티치펜던트에서 ROBOT_TOOL/ROBOT_TCP 가 선택돼 있는지 확인할 것.
+    """
 
     print("#" * 50)
     print("Initializing robot with the following settings:")
@@ -67,7 +82,9 @@ def loadpos():
     global hpos
 
     # 데이터의 안전한 Read를 위해 Python의 컨텍스트 매니저(with) 구문 활용
-    with open(JSON_PATH, "r") as f:
+    pose_file = find_pose_file()
+    print(f"Pose data: {pose_file}")
+    with open(pose_file, "r", encoding="utf-8") as f:
         posdata = json.load(f)
 
     # JSON 키값에 매핑된 좌표(6자유도 공간 좌표 [X, Y, Z, Rx, Ry, Rz] 또는 Joint 값) 추출
@@ -117,8 +134,6 @@ def basic_pose():
 
 def get_shovel():
     """삽(Tool) 보관소로 이동하여 그리퍼로 잡고 상단 안전 고도로 복귀하는 일련의 모션 시퀀스"""
-    global tpos
-    global tpos_above
     mforward_Tpos = [70, 0, 20, 0, 0, 0] # 상대 좌표 이동을 위한 오프셋 값 [dX, dY, dZ, dRx, dRy, dRz]
     
     # 순차적으로 이동할 타겟 포즈들의 시퀀스 배열화
@@ -147,7 +162,7 @@ def get_shovel():
 
 def make_furrow():
     """힘 제어(Force Control/Compliance Control) 메커니즘을 적용하여 지면에 삽을 대고 도랑을 파는 함수"""
-    from DSR_ROBOT2 import movel, wait, mwait, posx, DR_MV_MOD_REL, DR_FC_MOD_REL, DR_BASE, move_periodic, task_compliance_ctrl, release_force, set_desired_force, release_compliance_ctrl
+    from DSR_ROBOT2 import movel, wait, posx, DR_FC_MOD_REL, DR_BASE, move_periodic, task_compliance_ctrl, release_force, set_desired_force, release_compliance_ctrl
 
     # 1. 도랑 파기 지점 상공으로 직선 이동 후 지면 목표 좌표(gpos)로 하강
     movel(posx(gpos_above), time=1, vel=VELOCITY, acc=ACC)
@@ -169,7 +184,7 @@ def make_furrow():
     set_desired_force(fd=setfd, dir=setfdir, mod=DR_FC_MOD_REL)
 
     # 3. 주기적 모션(Periodic Move)을 통한 흙 파기 수행
-    # amp: 각 축별 왕복 운동 진폭 설정 (Ry축, 즉 피치 방향으로 15도씩 흔들며 도랑을 파헤침)
+    # amp: 각 축별 왕복 운동 진폭 설정 [x, y, z, rx, ry, rz] → 4번째 값이므로 Rx축(롤) 방향으로 15도씩 흔들며 도랑을 파헤침
     amp = [0, 0, 0, 15, 0, 0]
     # 로봇 베이스 좌표계(DR_BASE)를 기준으로 1초 주기로 5회 왕복 진동 모션 수행
     move_periodic(amp, period=1, repeat=5, ref=DR_BASE)
@@ -185,12 +200,7 @@ def make_furrow():
 
 def getback_shovel():
     """사용했던 삽(Tool)을 다시 보관소 위치에 안전하게 릴리즈하고 복귀하는 모션 시퀀스"""
-    global tpos
-    global tpos_above
-    global gpos
-    global gpos_above
-
-    from DSR_ROBOT2 import movel, mwait, posx, DR_MV_MOD_REL, DR_BASE
+    from DSR_ROBOT2 import movel, mwait, posx, DR_BASE
 
     # 역순 이동 경로 시퀀스 구성
     poslist = [gpos_above, tpos_above, tpos, tpos_above]

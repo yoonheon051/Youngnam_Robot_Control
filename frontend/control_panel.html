@@ -90,13 +90,19 @@
       font-size:13px;
       color: var(--muted);
     }
+    .status.err{ color: var(--danger); }
+    .robot{ margin-top:14px; font-size:14px; }
+    .robot-line{ margin-bottom:6px; }
+    .bar{ height:8px; border-radius:99px; background: rgba(255,255,255,.10); overflow:hidden; }
+    .bar i{ display:block; height:100%; width:0; background: var(--primary); transition: width .3s ease; }
   </style>
 </head>
 <body>
 
   <div class="wrap">
     <!-- ✅ 여기 PNG 파일명만 네 환경에 맞게 바꾸면 됨 -->
-    <img class="logo" src="yh_3.png" alt="영남향우회 로고" />
+    <!-- 로고 파일이 없으면 깨진 그림 대신 숨김 -->
+    <img class="logo" src="yh_3.png" alt="영남향우회 로고" onerror="this.style.display='none'" />
 
     <h1>영남향우회</h1>
     <p class="sub">원격 제어 패널</p>
@@ -108,12 +114,18 @@
     </div>
 
     <div class="status" id="ui-status">상태: 대기</div>
-    <div class="hint">※ ‘일시정지’를 누르면 ‘계속’으로 바뀝니다.</div>
+    <!-- main_controller.py 가 Firebase robot_status 에 쓰는 실제 로봇 상태 -->
+    <div class="robot">
+      <div class="robot-line">로봇: <b id="robot-status">연결 확인 중…</b> · <span id="robot-progress">0</span>%</div>
+      <div class="bar"><i id="robot-bar"></i></div>
+    </div>
+    <div class="hint">※ ‘일시정지’를 누르면 ‘계속’으로 바뀝니다.<br>
+      ※ 일시정지·중지는 진행 중인 동작이 끝난 뒤 적용됩니다. 위험할 때는 <b>물리 비상정지 버튼</b>을 누르세요.</div>
   </div>
 
   <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
-    import { getDatabase, ref, set } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-database.js";
+    import { getDatabase, ref, set, onValue } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-database.js";
 
     const app = initializeApp({
       databaseURL: "https://farm-9b777-default-rtdb.asia-southeast1.firebasedatabase.app/"
@@ -127,31 +139,56 @@
     const btnStop  = document.getElementById("btn-stop");
     const uiStatus = document.getElementById("ui-status");
 
-    function setStatus(text){
+    const robotStatus = document.getElementById("robot-status");
+    const robotProgress = document.getElementById("robot-progress");
+    const robotBar = document.getElementById("robot-bar");
+
+    function setStatus(text, isError = false){
       uiStatus.textContent = `상태: ${text}`;
+      uiStatus.classList.toggle("err", isError);
+    }
+
+    function setPaused(on){
+      paused = on;
+      btnPause.textContent = paused ? "계속" : "일시정지";
+    }
+
+    // 명령 전송. 실패하면(네트워크·DB 규칙) 버튼 상태를 바꾸지 않고 오류를 보여 준다
+    async function send(cmd, okText){
+      try {
+        await set(ref(db, "command"), { cmd });
+        setStatus(okText);
+        return true;
+      } catch (e) {
+        setStatus(`전송 실패 — ${e.message || e}`, true);
+        return false;
+      }
     }
 
     btnStart.onclick = async () => {
-      await set(ref(db, "command"), { cmd: "start" });
-      paused = false;
-      btnPause.textContent = "일시정지";
-      setStatus("시작 신호 전송");
+      if (await send("start", "시작 신호 전송")) setPaused(false);
     };
 
     btnPause.onclick = async () => {
       const cmd = paused ? "continue" : "pause";
-      await set(ref(db, "command"), { cmd });
-      paused = !paused;
-      btnPause.textContent = paused ? "계속" : "일시정지";
-      setStatus(paused ? "일시정지 신호 전송" : "계속 신호 전송");
+      if (await send(cmd, paused ? "계속 신호 전송" : "일시정지 신호 전송")) setPaused(!paused);
     };
 
     btnStop.onclick = async () => {
-      await set(ref(db, "command"), { cmd: "stop" });
-      paused = false;
-      btnPause.textContent = "일시정지";
-      setStatus("중지 신호 전송");
+      if (await send("stop", "중지 신호 전송")) setPaused(false);
     };
+
+    // 로봇이 실제로 기록한 상태·진행률을 실시간으로 표시. 새로고침해도 일시정지 버튼이 실제 상태와 맞도록 동기화
+    onValue(ref(db, "robot_status"), (snap) => {
+      const s = snap.val() || {};
+      const progress = Math.max(0, Math.min(100, Number(s.progress) || 0));
+      robotStatus.textContent = s.status || "기록 없음";
+      robotProgress.textContent = progress;
+      robotBar.style.width = progress + "%";
+      setPaused(s.status === "일시정지");
+    }, (e) => {
+      robotStatus.textContent = `읽기 실패 (${e.message || e})`;
+    });
   </script>
 
 </body>

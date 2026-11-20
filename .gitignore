@@ -1,6 +1,8 @@
 # Firebase 인증 키 (보안상 절대 업로드 금지)
 *.json
-!data.json  # 로봇 좌표 데이터인 data.json은 제외하고 싶다면 이 줄을 추가
+# 로봇 좌표 데이터(data.json)는 비밀이 아니므로 올릴 수 있게 예외 처리
+# (gitignore는 줄 끝 주석을 지원하지 않아서, 주석과 같은 줄에 두면 예외가 적용되지 않음)
+!data.json
 
 # Python 관련
 __pycache__/

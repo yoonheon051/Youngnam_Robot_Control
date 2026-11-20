@@ -44,9 +44,21 @@ import threading
 # threading: 파이썬에서 멀티스레딩(Multi-threading)을 구현하기 위한 내장 모듈
 # 외부 네트워크(Firebase)의 이벤트 대기 흐름이 ROS 2 시스템의 메인 실행 루프(Spin)를 멈추지 않도록, 별도의 독립된 백그라운드 작업 흐름(Daemon Thread)을 분리할 때 사용
 
-import time                                  
+import time
 # time: 시스템의 하드웨어 클록(Clock)에 접근하는 내장 모듈
 # 여기서는 로봇의 상태 및 피드백 로그가 발생하는 순간의 타임스탬프(시/분/초)를 문자열 포맷으로 추출하여 데이터베이스에 기록하기 위해 사용
+
+import os
+import sys
+# os, sys: Firebase 키 경로·DB 주소를 환경변수에서 읽고, 설정이 없으면 안내 후 종료하기 위해 사용
+
+from action_msgs.msg import GoalStatus
+# GoalStatus: 액션 결과가 성공(SUCCEEDED)인지 취소(CANCELED)·중단(ABORTED)인지 구분하기 위한 상태 코드
+
+# Firebase 설정: 환경변수로 덮어쓸 수 있고, 키는 기본으로 저장소의 config/firebase_key.json 을 쓴다
+REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FIREBASE_KEY = os.environ.get("FIREBASE_KEY", os.path.join(REPO_DIR, "config", "firebase_key.json"))
+FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL", "")
 
 # ===================================================================================================================================================================
 # ===================================================================================================================================================================
@@ -101,16 +113,25 @@ class TaskSequenceClient(Node):
         self.command_con1 = 0         # 소분류 포인터 (현재 대분류 딕셔너리 내부 리스트의 인덱스)
         
         # 현재 실행 중인 액션의 목표 핸들 객체 (Goal을 취소하거나 제어할 때 접근하는 인스턴스)
-        self.current_goal_handle = None 
+        self.current_goal_handle = None
+
+        # Firebase 리스너 스레드와 ROS 2 실행기 스레드가 같은 상태 변수를 바꾸므로 한 번에 하나만 처리
+        self._lock = threading.RLock()
+        # 시작·중지할 때마다 1씩 올리는 실행 번호. 중지 전에 보낸 목표의 늦은 응답·결과를 구분해서 무시하기 위함
+        self._run = 0
 
         # ======================================
         # 4. Firebase Realtime Database 연동 설정
         # ======================================
         # Firebase 애플리케이션의 중복 초기화를 방지하기 위한 예외 처리 조건문
         if not firebase_admin._apps:
-            cred = credentials.Certificate("cred/path") # 계정 인증용 서비스 키가 기록된 JSON 파일의 경로
+            if not os.path.isfile(FIREBASE_KEY):
+                sys.exit(f"Firebase 서비스 계정 키가 없습니다: {FIREBASE_KEY} (환경변수 FIREBASE_KEY 로 경로 지정 가능)")
+            if not FIREBASE_DB_URL:
+                sys.exit("환경변수 FIREBASE_DB_URL 에 Realtime Database 주소를 넣어 주세요.")
+            cred = credentials.Certificate(FIREBASE_KEY) # 계정 인증용 서비스 키가 기록된 JSON 파일의 경로
             firebase_admin.initialize_app(cred, {
-                'databaseURL': 'databaseURL'            # DB의 주소(URL)
+                'databaseURL': FIREBASE_DB_URL           # DB의 주소(URL)
             })
 
         # 실시간 데이터 교류를 위한 각 노드(데이터 트리 경로)의 레퍼런스(참조) 객체 할당
@@ -146,7 +167,7 @@ class TaskSequenceClient(Node):
     def subscribe_command(self):
         """Firebase 'command' 노드를 상시 모니터링하는 콜백 리스너 메서드"""
         
-        def callback(event):
+        def handle(event):
             # 앱 구동 시 최초 전송되는 데이터는 무시하고 플래그 전환
             if self._ignore_first_command_event:
                 self._ignore_first_command_event = False
@@ -178,8 +199,9 @@ class TaskSequenceClient(Node):
             elif cmd == "pause":
                 if self.sequence_active and not self.paused:
                     self.paused = True # 일시정지 플래그 활성화 (다음 액션 송신 차단)
-                    
+
                     # 현재 실행 중인 ROS 2 액션이 있다면 서버에 비동기 취소(Cancel Goal) 요청
+                    # (make_furrow_node 는 취소를 받지 않으므로, 실제로는 진행 중인 동작이 끝난 뒤 멈춘다)
                     if self.current_goal_handle:
                         try:
                             cancel_future = self.current_goal_handle.cancel_goal_async()
@@ -205,13 +227,16 @@ class TaskSequenceClient(Node):
                         'time': time.strftime('%H:%M:%S'), 'type': 'cmd', 'msg': '작업 재개'
                     })
                     self.status_ref.update({'status': '작업 진행 중'})
-                    # 멈췄던 인덱스 포인트 지점부터 다시 명령 송신 프로세스 재개
-                    self._send_current_command()
+                    # 멈췄던 인덱스 포인트 지점부터 다시 명령 송신 프로세스 재개.
+                    # 일시정지 전에 보낸 동작이 아직 진행 중이면 겹쳐 보내지 않고, 그 결과가 오면 _result_cb 가 이어서 보낸다
+                    if self.current_goal_handle is None:
+                        self._send_current_command()
 
             # -----------------------------------------------------------------
             # [CASE 4] STOP : 시퀀스 완전 중단 및 제어 변수 초기화 (긴급 정지 상태)
             # -----------------------------------------------------------------
             elif cmd == "stop":
+                self._run += 1        # 중지 전에 보낸 목표의 늦은 응답·결과는 무시
                 self.sequence_active = False
                 self.paused = False
                 self.command_con1 = 0 # 2중 루프 인덱스 완전 초기화
@@ -227,15 +252,20 @@ class TaskSequenceClient(Node):
 
                 self.status_ref.update({'status': '대기 중', 'progress': 0})
                 self.logs_ref.push({
-                    'time': time.strftime('%H:%M:%S'), 'type': 'error', 'msg': '긴급정지 → 작업 초기 상태로 복귀'
+                    'time': time.strftime('%H:%M:%S'), 'type': 'error',
+                    'msg': '중지 → 작업 초기 상태로 복귀 (진행 중이던 동작은 끝까지 수행됨. 비상 시 물리 비상정지 사용)'
                 })
-                self.get_logger().warn("EMERGENCY STOP → back to idle")
+                self.get_logger().warn("STOP → back to idle (current motion is not interrupted)")
 
             # 수신된 명령의 중복 실행을 방지하기 위해 Firebase의 해당 'command' 노드를 빈 객체로 리셋
             try:
                 self.cmd_ref.set({})
             except Exception:
                 pass
+
+        def callback(event):
+            with self._lock:   # 액션 콜백(ROS 2 실행기 스레드)과 동시에 상태를 바꾸지 않도록
+                handle(event)
 
         # Firebase 노드 감시 시작 및 이벤트 발생 시 내부 callback 함수 실행 등록
         self.cmd_ref.listen(callback)
@@ -244,6 +274,7 @@ class TaskSequenceClient(Node):
         """전체 작업 인덱스를 0으로 리셋하고 제어 엔진을 기동하는 메서드"""
         if self.sequence_active:
             return
+        self._run += 1
         self.command_con1 = 0
         self.command_con2 = 0
         self.sequence_active = True
@@ -292,7 +323,9 @@ class TaskSequenceClient(Node):
         # - feedback_callback: 서버가 주기적으로 전송하는 중간 상태 피드백 데이터를 처리할 메서드 바인딩
         send_future = client.send_goal_async(goal_msg, feedback_callback=self._feedback_cb)
         # - add_done_callback: 서버로부터 Goal 수락(Accept)/거절(Reject) 응답(Future)이 완료되었을 때 실행될 콜백 바인딩
-        send_future.add_done_callback(self._goal_response_cb)
+        #   보낸 시점의 실행 번호(run)를 함께 넘겨, 그사이 중지·재시작됐으면 응답을 무시한다
+        run = self._run
+        send_future.add_done_callback(lambda f: self._goal_response_cb(f, run))
 
     def _feedback_cb(self, feedback_msg):
         """액션 서버가 하드웨어 제어 중 실시간 피드백 토픽을 발행(Publish)할 때마다 동적으로 호출되는 콜백"""
@@ -304,52 +337,80 @@ class TaskSequenceClient(Node):
             'time': time.strftime('%H:%M:%S'), 'type': 'feedback', 'msg': fb.status
         })
         # 상태 변화가 감지될 때마다 진행률(%) 재연산 및 Firebase 갱신
-        self.update_progress()
+        with self._lock:
+            self.update_progress()
 
-    def _goal_response_cb(self, future):
+    def _goal_response_cb(self, future, run):
         """액션 서버가 클라이언트가 보낸 Goal 요청에 응답했을 때 호출되는 콜백"""
-        goal_handle = future.result()
-        
-        # 서버측 거절(Reject) 처리 시 실패 메서드 호출 후 시퀀스 다운
-        if not goal_handle.accepted:
-            self._fail("Goal rejected")
-            return
-            
-        # 수락(Accept) 시, 추후 캔슬(Cancel) 제어를 위해 전역 변수에 현재 활성 Goal Handle 보관
-        self.current_goal_handle = goal_handle
-        
-        # 액션의 최종 완료(Result) 상태를 비동기식으로 수신 대기하고 완료 콜백 바인딩
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(self._result_cb)
+        with self._lock:
+            goal_handle = future.result()
 
-    def _result_cb(self, future):
-        """액션 서버가 최종 결과(Succeeded/Aborted/Canceled)를 반환했을 때 호출되는 콜백"""
-        try:
-            res = future.result()
-        except Exception as e:
-            # 사용자가 일시정지를 눌러 발생한 의도된 액션 취소 예외(Exception)라면 에러 처리를 하지 않고 무시
-            if self.paused:
-                self.current_goal_handle = None
+            # 서버측 거절(Reject) 처리 시 실패 메서드 호출 후 시퀀스 다운 (지금 실행 중인 시퀀스의 목표일 때만)
+            if not goal_handle.accepted:
+                if run == self._run:
+                    self._fail("Goal rejected")
                 return
-            self._fail(f"Result exception: {e}")
-            return
 
-        # 결과 수신 시점에 이미 일시정지 상태로 플래그가 바뀌어 있다면 인덱스를 증가시키지 않고 루프 차단
-        if self.paused:
-            self.current_goal_handle = None
-            return
+            # 응답이 오기 전에 중지·재시작됐다면 이 목표는 버린다 (취소 요청을 보내 두고 결과는 무시)
+            if run != self._run or not self.sequence_active:
+                goal_handle.cancel_goal_async()
+                return
 
-        result = getattr(res, "result", None)
+            # 수락(Accept) 시, 추후 캔슬(Cancel) 제어를 위해 전역 변수에 현재 활성 Goal Handle 보관
+            self.current_goal_handle = goal_handle
 
-        # 액션 결과 내 내부 비즈니스 로직 판정이 실패(False)인 경우 예외 실패 처리
-        if hasattr(result, "accepted") and not result.accepted:
-            self._fail(getattr(result, "message", "Action failed"))
-            return
+            # 응답을 기다리는 사이에 일시정지가 왔다면 지금 취소를 요청 (서버가 받지 않으면 이 동작까지는 수행됨)
+            if self.paused:
+                goal_handle.cancel_goal_async()
 
-        # [단일 태스크 성공 수렴]
-        self.current_goal_handle = None
-        self.command_con1 += 1       # 하위 소분류 인덱스를 1 증가시켜 다음 세부 명령 지정
-        self._send_current_command() # 메인 제어 루프 메서드를 다시 호출하여 연속 순차 제어 달성
+            # 액션의 최종 완료(Result) 상태를 비동기식으로 수신 대기하고 완료 콜백 바인딩
+            result_future = goal_handle.get_result_async()
+            result_future.add_done_callback(lambda f: self._result_cb(f, run, goal_handle))
+
+    def _result_cb(self, future, run, goal_handle):
+        """액션 서버가 최종 결과(Succeeded/Aborted/Canceled)를 반환했을 때 호출되는 콜백"""
+        with self._lock:
+            # 중지·재시작 전에 보낸 목표의 결과는 무시 (인덱스를 건드리면 새 시퀀스가 꼬인다)
+            if run != self._run:
+                return
+            if goal_handle is self.current_goal_handle:
+                self.current_goal_handle = None
+
+            try:
+                res = future.result()
+            except Exception as e:
+                if self.paused:   # 일시정지 중의 예외는 계속(continue) 때 같은 동작을 다시 보내면 됨
+                    return
+                self._fail(f"Result exception: {e}")
+                return
+
+            status = getattr(res, "status", GoalStatus.STATUS_SUCCEEDED)
+
+            # 취소됨: 일시정지로 중간에 멈춘 동작 → 인덱스를 그대로 두고, 이미 계속(continue)이 눌렸으면 같은 동작을 다시 보냄
+            if status == GoalStatus.STATUS_CANCELED:
+                if self.paused:
+                    return
+                if self.sequence_active:
+                    self._send_current_command()
+                return
+
+            # 중단(ABORTED) 등 성공이 아닌 결과는 실패 처리
+            if status != GoalStatus.STATUS_SUCCEEDED:
+                self._fail(f"Action ended with status {status}")
+                return
+
+            result = getattr(res, "result", None)
+
+            # 액션 결과 내 내부 비즈니스 로직 판정이 실패(False)인 경우 예외 실패 처리
+            if hasattr(result, "accepted") and not result.accepted:
+                self._fail(getattr(result, "message", "Action failed"))
+                return
+
+            # [단일 태스크 성공 수렴]
+            # 일시정지 중에 끝났더라도 이 동작은 실제로 수행됐으므로 인덱스를 올린다.
+            # (올리지 않으면 계속(continue) 때 삽 집기 같은 동작을 한 번 더 하게 됨)
+            self.command_con1 += 1       # 하위 소분류 인덱스를 1 증가시켜 다음 세부 명령 지정
+            self._send_current_command() # 일시정지 중이면 여기서 바로 반환되고, 계속(continue) 때 이어서 보냄
 
     def update_progress(self):
         """딕셔너리에 매핑된 가중치(Weight) 데이터를 기반으로 전체 진행 상황을 백분율로 연산하는 수학적 메서드"""
@@ -361,7 +422,7 @@ class TaskSequenceClient(Node):
         )
         
         # 2. 현재 실행 중인 대분류(con2 단계) 내에서 이미 성공적으로 완료된 소분류(con1 이전 단계들) 가중치 추가 합산
-        if self.sequence_active and not self.paused:
+        if self.sequence_active and not self.paused and self.command_con2 < len(self.cmlist):
             done += sum(
                 self.command_weight[self.commands[self.cmlist[self.command_con2]][j]]
                 for j in range(self.command_con1)
